@@ -1,0 +1,14 @@
+{
+  "name": "@arieltoledo/pi-handoff",
+  "version": "0.1.0",
+  "description": "Project bootstrap and verified session handoffs for Pi and CodeGraph",
+  "type": "module",
+  "bin": { "pi-handoff": "bin/pi-handoff.js" },
+  "engines": { "node": ">=22.6" },
+  "keywords": ["pi-package", "handoff", "codegraph"],
+  "pi": { "extensions": ["./extensions/index.ts"] },
+  "files": ["bin/", "lib/", "extensions/", "resources/", "README.md"],
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "typebox": "*" },
+  "scripts": { "test": "node --test test/*.test.js", "typecheck": "tsc --noEmit" },
+  "devDependencies": { "@earendil-works/pi-coding-agent": "0.99.2", "@types/node": "^24.0.0", "typescript": "^5.9.0", "typebox": "^1.3.0" }
+}

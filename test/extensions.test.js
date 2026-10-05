@@ -8,6 +8,7 @@ import handoff from '../extensions/handoff.ts';
 import sync from '../extensions/codegraph-auto-sync.ts';
 import { packageRoot } from '../lib/cli.js';
 import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
+import { readResumeGuard } from '../lib/resume-guard.js';
 
 async function harness(extension) {
   const cwd = await mkdtemp(join(tmpdir(), 'pi-handoff-extension-'));
@@ -84,6 +85,103 @@ test('new-handoff uses fresh session context and refuses invalid state', async (
   await h.commands.get('new-handoff').handler('', h.ctx);
   assert.equal(replaced, 1);
 });
+test('new-handoff resumes an IN_PROGRESS checkpoint only once', async () => {
+  const h = await harness(handoff);
+
+  const inProgress = h.template.replace(
+    /(## Work Status\s*\n)[^\n]+/,
+    '$1IN_PROGRESS',
+  );
+
+  await h.write(inProgress);
+
+  let replaced = 0;
+  const sent = [];
+
+  h.ctx.newSession = async options => {
+    replaced++;
+
+    await options.withSession({
+      sendUserMessage: async text => {
+        sent.push(text);
+      },
+    });
+
+    return {
+      cancelled: false,
+    };
+  };
+
+  // First continuation is allowed.
+  await h.commands
+    .get('new-handoff')
+    .handler('', h.ctx);
+
+  assert.equal(replaced, 1);
+  assert.equal(sent.length, 1);
+
+  const guard =
+    await readResumeGuard(h.cwd);
+
+  assert.equal(
+    guard?.consumed,
+    true,
+  );
+
+  assert.equal(
+    guard?.workStatus,
+    'IN_PROGRESS',
+  );
+
+  // Same exact HANDOFF checkpoint must not create
+  // another continuation session.
+  await h.commands
+    .get('new-handoff')
+    .handler('', h.ctx);
+
+  assert.equal(
+    replaced,
+    1,
+    'same IN_PROGRESS checkpoint must be resumed only once',
+  );
+
+  assert.match(
+    h.notices.at(-1)[0],
+    /already been resumed/,
+  );
+});
+test('new-handoff releases IN_PROGRESS checkpoint when session creation is cancelled', async () => {
+  const h = await harness(handoff);
+
+  const inProgress = h.template.replace(
+    /(## Work Status\s*\n)[^\n]+/,
+    '$1IN_PROGRESS',
+  );
+
+  await h.write(inProgress);
+
+  h.ctx.newSession = async () => ({
+    cancelled: true,
+  });
+
+  await h.commands
+    .get('new-handoff')
+    .handler('', h.ctx);
+
+  const guard =
+    await readResumeGuard(h.cwd);
+
+  assert.equal(
+    guard,
+    null,
+    'cancelled session creation must release the consumed checkpoint',
+  );
+
+  assert.match(
+    h.notices.at(-1)[0],
+    /cancelled/i,
+  );
+});
 test('sync failures retain dirty state for retry', async () => {
   const h = await harness(sync);
   await mkdir(join(h.cwd, '.codegraph'));
@@ -95,12 +193,49 @@ test('sync failures retain dirty state for retry', async () => {
   await h.emit('agent_settled');
   assert.equal(attempts, 2);
 });
+test('new-handoff releases IN_PROGRESS checkpoint when session creation throws', async () => {
+  const h = await harness(handoff);
+
+  const inProgress = h.template.replace(
+    /(## Work Status\s*\n)[^\n]+/,
+    '$1IN_PROGRESS',
+  );
+
+  await h.write(inProgress);
+
+  h.ctx.newSession = async () => {
+    throw new Error('synthetic session failure');
+  };
+
+  await assert.rejects(
+    () =>
+      h.commands
+        .get('new-handoff')
+        .handler('', h.ctx),
+    /synthetic session failure/,
+  );
+
+  const guard =
+    await readResumeGuard(h.cwd);
+
+  assert.equal(
+    guard,
+    null,
+    'failed session creation must release the consumed checkpoint',
+  );
+});
 test('real Pi loader loads package once and excludes legacy files only for this project', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-handoff-loader-'));
   const cwd = join(root, 'repo'), agentDir = join(root, 'agent');
   await mkdir(join(cwd, '.pi'), { recursive: true });
   await mkdir(join(agentDir, 'extensions'), { recursive: true });
-  const names = ['handoff.ts', 'session-supervisor.ts', 'codegraph-auto-sync.ts', 'codegraph-guard.ts'];
+  const names = [
+  'handoff.ts',
+  'session-supervisor.ts',
+  'codegraph-auto-sync.ts',
+  'codegraph-guard.ts',
+  'recovery.ts',
+];
   const paths = names.map(name => join(agentDir, 'extensions', name));
   for (const path of paths) await writeFile(path, 'export default function(pi) { pi.registerCommand("legacy", { description: "legacy", handler: async () => {} }); }');
   await writeFile(join(cwd, '.pi/settings.json'), JSON.stringify({ packages: [packageRoot], extensions: paths.flatMap(path => [path, `-${path}`]) }));

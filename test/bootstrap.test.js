@@ -3,9 +3,15 @@ import { test } from 'node:test';
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mergeAgents, packageRoot } from '../lib/cli.js';
-import { fingerprint, validateHandoff } from '../lib/handoff.js';
+import {
+  fingerprint,
+  getWorkStatus,
+  isLegacyHandoff,
+  validateHandoff,
+} from '../lib/handoff.js';
+import { readResumeGuard } from '../lib/resume-guard.js';
 
 test('managed AGENTS block preserves unrelated user text and is idempotent', () => {
   const fragment = '<!-- pi-handoff:start -->\nnew rules\n<!-- pi-handoff:end -->';
@@ -24,6 +30,107 @@ test('handoff rejects absent, partial and empty sections', async () => {
   assert.ok(validateHandoff(valid.replace(/## Next Step[\s\S]*/, '## Next Step\n')));
   assert.notEqual(fingerprint(valid), fingerprint(valid + '\nVerified today.'));
 });
+
+test('handoff v2 validates work status and preserves legacy compatibility', async () => {
+  const valid = await readFile(
+    join(packageRoot, 'resources/HANDOFF.template.md'),
+    'utf8',
+  );
+
+  assert.equal(isLegacyHandoff(valid), false);
+  assert.equal(getWorkStatus(valid), 'AWAITING_USER');
+
+  const withStatus = status =>
+    valid.replace(
+      /(## Work Status\s*\n)[^\n]+/,
+      `$1${status}`,
+    );
+
+  for (const status of [
+    'IN_PROGRESS',
+    'COMPLETE',
+    'BLOCKED',
+    'AWAITING_USER',
+  ]) {
+    assert.equal(
+      validateHandoff(withStatus(status)),
+      null,
+      `expected ${status} to be valid`,
+    );
+
+    assert.equal(
+      getWorkStatus(withStatus(status)),
+      status,
+    );
+  }
+
+  const invalidStatus =
+    withStatus('RUNNING');
+
+  assert.match(
+    validateHandoff(invalidStatus),
+    /Invalid Work Status/,
+  );
+
+  assert.equal(
+    getWorkStatus(invalidStatus),
+    null,
+  );
+
+  const partialV2 =
+    valid.replace(
+      '## Authorized Scope',
+      '## Removed Authorized Scope',
+    );
+
+  assert.match(
+    validateHandoff(partialV2),
+    /Authorized Scope/,
+  );
+
+  const legacy = `# Session Handoff
+
+## Current Goal
+Continue the authorized task.
+
+## Completed
+Initial implementation completed.
+
+## Decisions
+Keep the implementation minimal.
+
+## Files Changed
+app.py
+
+## Tests
+Tests not yet run.
+
+## Current State
+Work remains incomplete.
+
+## Blockers
+None.
+
+## Next Step
+Finish the remaining authorized work.
+`;
+
+  assert.equal(
+    isLegacyHandoff(legacy),
+    true,
+  );
+
+  assert.equal(
+    getWorkStatus(legacy),
+    null,
+  );
+
+  assert.equal(
+    validateHandoff(legacy),
+    null,
+  );
+});
+
 test('bootstrap installs once, preserves files/settings, excludes legacy and start checks errors', async () => {
   const root = await mkdtemp(join(tmpdir(), 'pi-handoff-test-'));
   const repo = join(root, 'repo'), bin = join(root, 'bin'), agent = join(root, 'agent');
@@ -50,9 +157,203 @@ test('bootstrap installs once, preserves files/settings, excludes legacy and sta
   assert.ok(settings.extensions.includes(`-${join(agent, 'extensions/handoff.ts')}`));
   assert.equal(await readFile(join(agent, 'extensions/handoff.ts'), 'utf8'), '// original');
   assert.match(await readFile(join(repo, 'AGENTS.md'), 'utf8'), /^Existing user rules/);
+
   assert.equal(invoke(['doctor']).status, 0);
   assert.equal(invoke(['start', '--dry-run']).status, 0);
   assert.equal(invoke(['start'], { FAIL_SYNC: '1' }).status, 1);
-  await writeFile(join(repo, '.agent/HANDOFF.md'), 'bad handoff');
-  assert.equal(invoke(['start']).status, 1);
+
+  /**
+   * IN_PROGRESS start is one-shot.
+   *
+   * First start consumes the checkpoint and launches Pi normally.
+   * A second start with the exact same HANDOFF must launch Pi in
+   * RESUME GUARD mode instead of authorizing another continuation.
+   */
+  const inProgress = handoff.replace(
+    /(## Work Status\s*\n)[^\n]+/,
+    '$1IN_PROGRESS',
+  );
+
+  await writeFile(
+    join(repo, '.agent/HANDOFF.md'),
+    inProgress,
+  );
+
+  const firstResume = invoke(['start']);
+
+  assert.equal(
+    firstResume.status,
+    0,
+    firstResume.stderr,
+  );
+
+  const resumeState =
+    await readResumeGuard(repo);
+
+  assert.equal(
+    resumeState?.consumed,
+    true,
+  );
+
+  assert.equal(
+    resumeState?.workStatus,
+    'IN_PROGRESS',
+  );
+
+  assert.equal(
+    resumeState?.source,
+    'pi-handoff start',
+  );
+
+  const secondResume = invoke(['start']);
+
+  assert.equal(
+    secondResume.status,
+    0,
+    secondResume.stderr,
+  );
+
+  assert.match(
+    secondResume.stdout,
+    /RESUME GUARD: this IN_PROGRESS handoff has already been resumed/,
+  );
+
+  const callsAfterResume =
+    await readFile(log, 'utf8');
+
+  const lastPiCall =
+    callsAfterResume
+      .split('\n')
+      .filter(line => line.startsWith('pi '))
+      .at(-1);
+
+  assert.match(
+    lastPiCall,
+    /RESUME GUARD/,
+  );
+
+  /**
+ * Two concurrent CLI starts using the same fresh IN_PROGRESS
+ * checkpoint must produce exactly one continuation and one
+ * resume-guard rejection.
+ */
+const concurrentHandoff =
+  `${inProgress}\n<!-- concurrent-start-test -->\n`;
+
+await writeFile(
+  join(repo, '.agent/HANDOFF.md'),
+  concurrentHandoff,
+);
+
+const startConcurrent = () =>
+  new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [
+        join(packageRoot, 'bin/pi-handoff.js'),
+        'start',
+      ],
+      {
+        cwd: repo,
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          PI_CODING_AGENT_DIR: agent,
+          CALL_LOG: log,
+        },
+        stdio: [
+          'ignore',
+          'pipe',
+          'pipe',
+        ],
+      },
+    );
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on(
+      'data',
+      chunk => {
+        stdout += chunk;
+      },
+    );
+
+    child.stderr.on(
+      'data',
+      chunk => {
+        stderr += chunk;
+      },
+    );
+
+    child.on(
+      'error',
+      reject,
+    );
+
+    child.on(
+      'close',
+      status => {
+        resolve({
+          status,
+          stdout,
+          stderr,
+        });
+      },
+    );
+  });
+
+const concurrentResults =
+  await Promise.all([
+    startConcurrent(),
+    startConcurrent(),
+  ]);
+
+for (const result of concurrentResults) {
+  assert.equal(
+    result.status,
+    0,
+    result.stderr,
+  );
+}
+
+const concurrentOutput =
+  concurrentResults
+    .map(result => result.stdout)
+    .join('\n');
+
+const consumeCount =
+  (
+    concurrentOutput.match(
+      /RESUME GUARD: consuming IN_PROGRESS checkpoint/g,
+    ) ?? []
+  ).length;
+
+const rejectCount =
+  (
+    concurrentOutput.match(
+      /RESUME GUARD: this IN_PROGRESS handoff has already been resumed/g,
+    ) ?? []
+  ).length;
+
+assert.equal(
+  consumeCount,
+  1,
+  'exactly one concurrent CLI start must acquire the checkpoint',
+);
+
+assert.equal(
+  rejectCount,
+  1,
+  'exactly one concurrent CLI start must be blocked by the resume guard',
+);
+  /**
+   * Invalid handoffs are still rejected before Pi starts.
+   */
+  await writeFile(
+    join(repo, '.agent/HANDOFF.md'),
+    'bad handoff',
+  );
+
+    assert.equal(invoke(['start']).status, 1);
 });

@@ -10,7 +10,10 @@ type SupervisorPhase =
   | 'soft-pressure'
   | 'hard-pressure-pending'
   | 'handoff-requested'
+  | 'preparing-handoff'
   | 'handoff-running'
+  | 'validating-handoff'
+  | 'reset-pending'
   | 'cancelled';
 
 function getContextPercent(ctx: Pick<ExtensionContext, 'getContextUsage'>): number | undefined {
@@ -29,14 +32,24 @@ export default function (pi: ExtensionAPI) {
   let reason = '';
   let before: string | null = null;
   let generation = 0;
-  const reset = () => { generation++; phase = 'idle'; reason = ''; before = null; };
+  let recoveryMode = false;
+  const reset = () => { generation++; phase = 'idle'; reason = ''; before = null; recoveryMode = false; };
   pi.on('session_start', async () => reset());
+  pi.on('before_agent_start', async event => {
+    // Recovery startup supplies this explicit diagnosis-only prompt. Keep the
+    // session in recovery mode for later turns until a new Pi session starts.
+    if (/^\s*RECOVERY MODE\b/.test(event.prompt)) recoveryMode = true;
+  });
 
   function checkContextPressure(ctx: ExtensionContext): void {
     // Handoff-control turns must not recursively request another handoff.
+    if (recoveryMode) return;
     if (
       phase === 'handoff-requested' ||
+      phase === 'preparing-handoff' ||
       phase === 'handoff-running' ||
+      phase === 'validating-handoff' ||
+      phase === 'reset-pending' ||
       phase === 'hard-pressure-pending' ||
       phase === 'cancelled'
     ) return;
@@ -74,6 +87,9 @@ export default function (pi: ExtensionAPI) {
     description: 'Request a verified session handoff after completing a semantic unit of work, or when a context reset is necessary. Record unfinished work accurately for context resets.',
     parameters: Type.Object({ reason: Type.String({ minLength: 1 }) }),
     async execute(_id, params) {
+      if (recoveryMode) {
+        return { content: [{ type: 'text', text: 'Supervisor handoffs are disabled during Crash Recovery diagnosis.' }], details: { phase, reason } };
+      }
       if (phase === 'idle' || phase === 'soft-pressure' || phase === 'cancelled') {
         phase = 'handoff-requested'; reason = params.reason;
       }
@@ -92,7 +108,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
   pi.on('agent_settled', async (_event, ctx) => {
+    if (recoveryMode) return;
     if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
+    if (
+      phase === 'preparing-handoff' ||
+      phase === 'validating-handoff' ||
+      phase === 'reset-pending'
+    ) return;
     const token = generation;
     try {
       if (phase === 'idle') {
@@ -101,6 +123,9 @@ export default function (pi: ExtensionAPI) {
       if (phase === 'idle' || phase === 'soft-pressure' || phase === 'cancelled') return;
       if (phase === 'hard-pressure-pending') phase = 'handoff-requested';
       if (phase === 'handoff-requested') {
+        // Latch before awaiting disk I/O so concurrent settled events cannot
+        // start a second preparation for the same transition.
+        phase = 'preparing-handoff';
         before = fingerprint(await readHandoff(ctx.cwd));
         if (token !== generation) return;
         phase = 'handoff-running';
@@ -109,15 +134,18 @@ export default function (pi: ExtensionAPI) {
         pi.sendUserMessage(preparePrompt);
         return;
       }
+      phase = 'validating-handoff';
       const text = await readHandoff(ctx.cwd);
       if (token !== generation) return;
       const error = validateHandoff(text) ?? (fingerprint(text) === before ? 'HANDOFF.md was not refreshed.' : null);
-      reset();
       if (error) {
         preserveSession();
         ctx.ui.notify(`Session preserved: ${error}`, 'warning');
         return;
       }
+      // Keep this transition latched until Pi starts the replacement session.
+      // Repeated settled events must not enqueue another fresh-session command.
+      phase = 'reset-pending';
       pi.sendUserMessage('/new-handoff', { expandPromptTemplates: true });
     } catch (error) {
       if (token !== generation) return;

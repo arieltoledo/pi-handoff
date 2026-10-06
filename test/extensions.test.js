@@ -7,7 +7,9 @@ import supervisor from '../extensions/session-supervisor.ts';
 import handoff from '../extensions/handoff.ts';
 import sync from '../extensions/codegraph-auto-sync.ts';
 import codegraphGuard from '../extensions/codegraph-guard.ts';
+import recoveryExtension from '../extensions/recovery.ts';
 import { packageRoot } from '../lib/cli.js';
+import { recoveryPrompt } from '../lib/recovery.js';
 import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { readResumeGuard } from '../lib/resume-guard.js';
 
@@ -49,6 +51,147 @@ test('supervisor waits for queues, verifies changed handoff, and requests only o
   await h.emit('session_start');
   await h.emit('agent_settled');
   assert.equal(h.messages.length, 2);
+});
+
+test('overlapping settled events cannot duplicate asynchronous handoff preparation', async () => {
+  const h = await harness(supervisor);
+  await h.tools.get('request_handoff').execute('id', { reason: 'feature complete' });
+  h.ctx.getContextUsage = () => ({ percent: 80 });
+
+  // The first event reaches readHandoff() and yields at its asynchronous file
+  // read. Emit competing lifecycle events before allowing that read to settle.
+  let finished = false;
+  const preparation = h.emit('agent_settled').finally(() => { finished = true; });
+  assert.equal(finished, false);
+  await h.emit('tool_execution_end', { toolName: 'handoff-control', isError: false });
+  const converged = await h.tools.get('request_handoff').execute('id', { reason: 'pressure overlap' });
+  assert.equal(converged.details.phase, 'preparing-handoff');
+  await h.emit('agent_settled');
+  await h.emit('turn_end', { turnIndex: 1, toolResults: [] });
+  assert.equal(await h.toolCall({ toolName: 'still-allowed-control-tool' }), undefined);
+  assert.equal(finished, false);
+  await preparation;
+
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0][0], /Prepare a session handoff/);
+});
+
+test('overlapping HANDOFF validation emits only one fresh-session request', async () => {
+  const h = await harness(supervisor);
+  await h.tools.get('request_handoff').execute('id', { reason: 'checkpoint' });
+  await h.emit('agent_settled');
+  await h.write(h.template + '\nVerified: lifecycle validation race.\n');
+  h.ctx.getContextUsage = () => ({ percent: 80 });
+
+  let finished = false;
+  const validation = h.emit('agent_settled').finally(() => { finished = true; });
+  assert.equal(finished, false);
+  await h.emit('tool_execution_end', { toolName: 'handoff-control', isError: false });
+  await h.emit('agent_settled');
+  assert.equal(await h.toolCall({ toolName: 'still-allowed-validation-tool' }), undefined);
+  assert.equal(finished, false);
+  await validation;
+
+  assert.equal(h.messages.length, 2);
+  assert.deepEqual(h.messages[1], ['/new-handoff', { expandPromptTemplates: true }]);
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 2);
+});
+
+test('reset-pending stays latched until new session and then accepts new work', async () => {
+  const h = await harness(supervisor);
+  await h.tools.get('request_handoff').execute('id', { reason: 'first transition' });
+  await h.emit('agent_settled');
+  await h.write(h.template + '\nVerified: first transition.\n');
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 2);
+
+  h.ctx.getContextUsage = () => ({ percent: 75 });
+  await h.emit('tool_execution_end', { toolName: 'late-tool', isError: false });
+  await h.emit('turn_end', { turnIndex: 3, toolResults: [] });
+  await h.emit('agent_settled');
+  const duplicate = await h.tools.get('request_handoff').execute('id', { reason: 'duplicate' });
+  assert.equal(duplicate.details.phase, 'reset-pending');
+  assert.equal(h.messages.length, 2, 'queued reset is not emitted again while pending');
+
+  await h.emit('session_start', { reason: 'new' });
+  h.ctx.getContextUsage = () => ({ percent: 20 });
+  await h.tools.get('request_handoff').execute('id', { reason: 'new session work' });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 3);
+  assert.match(h.messages[2][0], /Prepare a session handoff/);
+});
+
+test('Recovery Mode prompt suppresses supervisor transitions until a new session', async () => {
+  const h = await harness(supervisor);
+  const prompt = recoveryPrompt({
+    sessionId: 'prior-session',
+    userRequest: 'interrupted task',
+    currentTool: { name: 'bash', startedAt: 'earlier' },
+  });
+  await h.emit('session_start', { reason: 'startup' });
+  await h.emit('before_agent_start', { prompt });
+
+  h.ctx.getContextUsage = () => ({ percent: 80 });
+  await h.emit('tool_execution_end', { toolName: 'diagnostic-read', isError: false });
+  await h.emit('turn_end', { turnIndex: 1, toolResults: [] });
+  await h.emit('agent_settled');
+  assert.equal(await h.toolCall({ toolName: 'diagnostic-next' }), undefined);
+  const rejected = await h.tools.get('request_handoff').execute('id', { reason: 'model request' });
+  assert.match(rejected.content[0].text, /disabled during Crash Recovery/);
+  assert.equal(h.messages.length, 0);
+
+  await h.emit('session_start', { reason: 'new' });
+  h.ctx.getContextUsage = () => ({ percent: 20 });
+  await h.tools.get('request_handoff').execute('id', { reason: 'user chose to proceed' });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0][0], /Prepare a session handoff/);
+});
+
+test('cancellation and a new session invalidate pending asynchronous preparation', async () => {
+  for (const invalidateWith of ['cancel', 'session_start']) {
+    const h = await harness(supervisor);
+    await h.tools.get('request_handoff').execute('id', { reason: 'pending transition' });
+    const pending = h.emit('agent_settled');
+    if (invalidateWith === 'cancel') {
+      await h.commands.get('supervisor-cancel').handler('', h.ctx);
+    } else {
+      await h.emit('session_start', { reason: 'new' });
+    }
+    await pending;
+    await h.emit('agent_settled');
+    assert.equal(h.messages.length, 0, `${invalidateWith} invalidates stale preparation work`);
+  }
+});
+
+test('Recovery journal records intentional new-session shutdown as clean', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'pi-handoff-recovery-'));
+  await mkdir(join(cwd, '.agent'));
+  const handlers = new Map(), commands = new Map(), messages = [], notices = [];
+  const pi = {
+    on: (name, handler) => handlers.set(name, handler),
+    registerCommand: (name, command) => commands.set(name, command),
+    sendUserMessage: (...args) => messages.push(args),
+  };
+  const ctx = { cwd, getContextUsage: () => ({ percent: 20 }),
+    ui: { notify: (...args) => notices.push(args) } };
+  const originalCwd = process.cwd();
+  try {
+    process.chdir(cwd);
+    recoveryExtension(pi);
+    process.chdir(originalCwd);
+    await handlers.get('before_agent_start')({ prompt: 'diagnostic recovery session' }, ctx);
+    const active = JSON.parse(await readFile(join(cwd, '.agent/RECOVERY.json'), 'utf8'));
+    assert.equal(active.status, 'active');
+
+    await handlers.get('session_shutdown')({ reason: 'new' }, ctx);
+    const clean = JSON.parse(await readFile(join(cwd, '.agent/RECOVERY.json'), 'utf8'));
+    assert.equal(clean.status, 'clean');
+    assert.equal(clean.shutdownReason, 'new');
+  } finally {
+    process.chdir(originalCwd);
+  }
 });
 test('supervisor preserves session when handoff is unchanged or invalid', async () => {
   for (const bad of [null, '# incomplete handoff']) {

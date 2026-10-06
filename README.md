@@ -1,656 +1,154 @@
 # pi-handoff
 
-Persistent, crash-aware session handoff and context management for the Pi Coding Agent.
-
-`pi-handoff` helps long-running coding agents work across multiple fresh Pi sessions without depending on an ever-growing conversation history.
-
-Instead of treating the conversation as the source of truth, it keeps the important working state inside the repository and reconstructs context from:
-
-- the repository itself;
-- Git state;
-- CodeGraph;
-- `.agent/HANDOFF.md`;
-- `.agent/RECOVERY.json` after an unexpected crash.
-
-The goal is simple:
+`pi-handoff` coordinates fresh Pi Coding Agent sessions using explicit project state instead of relying on an ever-growing conversation.
 
 > Preserve project state, not conversations.
 
----
+HANDOFF files record the task and its authorized scope. Repository files and Git state remain authoritative. A new session verifies that state before acting.
 
-## Why pi-handoff?
+## Lifecycle architecture
 
-Long coding-agent sessions eventually accumulate large amounts of context.
+### HANDOFF v2
 
-This creates several problems:
+The semantic checkpoint lives at `.agent/HANDOFF.md`. It records:
 
-- repeated file reads;
-- stale assumptions about repository state;
-- expensive context growth;
-- native context compaction;
-- degraded reasoning over long sessions;
-- difficulty recovering after crashes;
-- accidental continuation beyond the user's authorized scope.
+- **User Request** and **Authorized Scope**: the task and work permitted across sessions;
+- **Work Status**: `IN_PROGRESS`, `COMPLETE`, `BLOCKED`, or `AWAITING_USER`;
+- **Current Goal**, **Completed**, **Decisions**, **Files Changed**, and **Tests**;
+- **Current State**, **Blockers**, and **Next Step**;
+- **Requires User Approval** for work outside the current authorization.
 
-`pi-handoff` introduces explicit session lifecycle management around Pi.
+**Next Step is not authorization.** A fresh session may automatically continue only `IN_PROGRESS` work within Authorized Scope. For `COMPLETE`, `BLOCKED`, and `AWAITING_USER`, it verifies the state and waits for the user.
 
-A typical workflow becomes:
+### Resume Guard
 
-```text
-User task
-   ↓
-Pi + CodeGraph
-   ↓
-implementation
-   ↓
-tests / validation
-   ↓
-semantic checkpoint
-   ↓
-HANDOFF.md
-   ↓
-fresh Pi session
-   ↓
-repository + handoff + CodeGraph
-   ↓
-continue
-```
+An `IN_PROGRESS` handoff is claimed atomically by its content fingerprint. A second continuation from the same checkpoint is blocked. If Pi cancels fresh-session creation or it fails before continuation begins, that claim is released so the checkpoint can be retried. `COMPLETE`, `BLOCKED`, and `AWAITING_USER` do not use this one-shot claim.
 
-If Pi crashes unexpectedly:
-
-```text
-working session
-   ↓
-RECOVERY.json
-   ↓
-unexpected termination
-   ↓
-pi-handoff start
-   ↓
-Recovery Mode
-   ↓
-inspect repository + crash journal
-   ↓
-ask the user how to continue
-```
+### Context Pressure v2
 
----
+The supervisor records soft pressure at about 65% context and latches hard pressure at about 70%. It checks during active work, including after tool execution completes. Already-running tools are allowed to finish; once hard pressure is latched, later tool calls can be blocked. Handoff preparation waits for a safe lifecycle boundary and uses the normal HANDOFF flow. This aims to preserve project state before Pi's native compaction threshold when possible; native compaction can still occur, and behavior depends on the supported Pi API.
 
-# Features
+### Crash Recovery
 
-## Semantic session handoff
+`.agent/RECOVERY.json` is updated during Pi work. An abrupt termination can leave it active. On the next `pi-handoff start`, the journal is preserved as `.agent/RECOVERY.last-crash.json` and Pi starts in Recovery Mode. Recovery is diagnosis-only: the interrupted tool is not replayed, and the agent asks the user how to proceed. Recovery does not consume an `IN_PROGRESS` Resume Guard claim.
 
-The agent can request a clean handoff after completing a meaningful unit of work such as:
+### CodeGraph Guard v2
 
-- a feature;
-- a bug fix;
-- a refactor;
-- a migration stage;
-- another verified checkpoint.
+CodeGraph is preferred for repository discovery: finding symbols, implementations, callers, dependencies, and related files. `ls`, known-file reads, and command-output filtering such as `npx vitest run | grep failed` are allowed. Before CodeGraph orientation, broad direct `rg`, `find`, and recursive `grep` searches may be guarded. A CodeGraph tool attempt permits focused fallback discovery for that agent turn. This is workflow guidance, not a security boundary or a complete shell parser.
 
-The supervisor waits until the current Pi run is fully settled before preparing the handoff.
+### Lifecycle coordination
 
----
+The supervisor allows one live transition at a time and suppresses duplicate `/handoff` and `/new-handoff` requests. Cancellation invalidates pending asynchronous lifecycle work. Recovery Mode suppresses normal supervisor transitions. Pi's intentional fresh-session shutdown is recorded as clean so it is not mistaken for a crash.
 
-## Fresh-session continuation
+## Requirements and compatibility
 
-A completed handoff starts a new Pi session rather than continuing indefinitely in the old conversation.
+The supported Pi range is **`>=0.99.2 <0.100.0`**. The extension lifecycle APIs were validated against Pi 0.99.2; future `0.x` minor versions are not assumed compatible automatically. Run `pi-handoff doctor` to check the installed version and project setup. Versions inside the declared range are accepted by the compatibility check, but that does not mean each patch release was individually exercised.
 
-The fresh session reconstructs its working context using:
+`pi-handoff` does not own Pi core. It does not automatically upgrade or downgrade Pi. If the installed Pi version is unsupported or cannot be verified, startup stops before lifecycle state is changed.
 
-```text
-.agent/HANDOFF.md
-+ repository state
-+ Git
-+ CodeGraph
-```
+The CLI requires Node.js `>=22.6`. Pi and CodeGraph must be available. `init --install-tools` installs missing CLIs only when explicitly requested: Pi is pinned to 0.99.2 and CodeGraph CLI to 1.6.1. It does not replace an already-installed unsupported Pi. The CodeGraph Pi extension is registered as `@izhimu/pi-codegraph@0.3.0` when needed.
 
-This allows old conversational context to become disposable.
+## Install for local development
 
----
-
-## Context-pressure handoff
-
-Long-running work can also trigger a preventive handoff when context usage becomes too high.
-
-Semantic checkpoints are preferred, while context pressure acts as a safety mechanism for unusually long tasks.
-
----
-
-## Crash Recovery
-
-`pi-handoff` maintains a crash journal:
-
-```text
-.agent/RECOVERY.json
-```
-
-During agent execution it records information such as:
-
-- Pi session ID;
-- original user request;
-- current status;
-- context utilization;
-- current tool call;
-- last completed tool call;
-- timestamps.
-
-Example:
-
-```json
-{
-  "version": 1,
-  "status": "active",
-  "userRequest": "Refactor the runtime provider layer",
-  "currentTool": {
-    "name": "write",
-    "startedAt": "2026-10-04T23:42:29.141Z"
-  }
-}
-```
-
-A normal Pi shutdown changes the journal to:
-
-```json
-{
-  "status": "clean",
-  "shutdownReason": "quit"
-}
-```
-
-If Pi is killed or the machine stops before shutdown, the journal remains:
-
-```json
-{
-  "status": "active"
-}
-```
-
-`pi-handoff start` detects this state automatically.
-
-Before starting the new recovery session, the crash evidence is preserved as:
-
-```text
-.agent/RECOVERY.last-crash.json
-```
-
----
-
-## Assisted Recovery Mode
-
-Crash recovery is intentionally conservative.
-
-After an unexpected termination, the new agent does **not** automatically replay the interrupted operation or continue modifying the repository.
-
-Instead it:
-
-1. reads the crash journal;
-2. reads the last clean handoff;
-3. inspects Git state when available;
-4. uses CodeGraph to inspect the repository;
-5. identifies potentially incomplete work;
-6. evaluates which previous validation results are still trustworthy;
-7. reports the safest recovery point;
-8. asks the user how to proceed.
-
-Typical options are:
-
-```text
-1. Resume from the safest recovered point.
-2. Inspect the current changes first.
-3. Return to the last clean checkpoint.
-4. Discard the interrupted task and start fresh.
-```
-
-No recovery action is executed until the user chooses.
-
----
-
-## CodeGraph integration
-
-`pi-handoff` integrates with:
-
-```text
-@izhimu/pi-codegraph
-```
-
-CodeGraph is used for semantic repository discovery, including:
-
-- symbols;
-- dependencies;
-- callers;
-- tests;
-- blast radius;
-- current source.
-
-The integration also keeps the CodeGraph index synchronized after source edits.
-
-Traditional shell tools remain available as fallback mechanisms.
-
----
-
-# Installation
-
-## Requirements
-
-The currently tested stack includes:
-
-```text
-Pi Coding Agent 0.99.2
-CodeGraph CLI 1.6.1
-@izhimu/pi-codegraph 0.3.x
-Node.js
-```
-
-A local LLM is optional.
-
-`pi-handoff` works with Pi's configured model/provider stack.
-
-For example, the project has been tested with Pi connected to a local `llama.cpp` server running Qwen.
-
----
-
-## Local development installation
-
-Clone the repository:
+The package is prepared for release but is not documented as a published npm installation. Clone the confirmed repository and install its development dependencies:
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/arieltoledo/pi-handoff.git
 cd pi-handoff
 npm install
 ```
 
-From another project:
+Run the CLI from the checkout (or link it into your PATH using your preferred local workflow):
 
 ```bash
-cd ~/Development/my-project
+node /path/to/pi-handoff/bin/pi-handoff.js init --cwd /path/to/project
+```
+
+If Pi or CodeGraph is missing, install missing tools explicitly:
+
+```bash
+node /path/to/pi-handoff/bin/pi-handoff.js init --cwd /path/to/project --install-tools
+```
+
+## Normal workflow
+
+```text
 pi-handoff init
-```
-
-If Pi or CodeGraph are missing:
-
-```bash
-pi-handoff init --install-tools
-```
-
----
-
-# Commands
-
-## Initialize a repository
-
-```bash
-pi-handoff init
-```
-
-This prepares the current repository for managed Pi sessions.
-
-It can:
-
-- register the `pi-handoff` Pi package;
-- install/register the CodeGraph Pi extension;
-- initialize CodeGraph;
-- create `.agent/HANDOFF.md`;
-- merge lifecycle instructions into `AGENTS.md`;
-- configure project-local Pi settings;
-- exclude legacy global extension copies.
-
-The operation is intended to be idempotent.
-
----
-
-## Diagnose the environment
-
-```bash
+       ↓
 pi-handoff doctor
-```
-
-Example:
-
-```text
-Project: /home/user/Development/project
-
-OK Node
-OK Pi
-OK CodeGraph
-OK Handoff package (project)
-OK CodeGraph extension
-OK CodeGraph index
-OK HANDOFF.md
-OK AGENTS.md lifecycle rules
-OK Legacy extensions excluded in this project
-```
-
-`llama-server` and Pi Llama configuration are informational checks and are not required for every Pi setup.
-
----
-
-## Show project status
-
-```bash
-pi-handoff status
-```
-
-This also displays CodeGraph status when the index is available.
-
----
-
-## Update integrations
-
-```bash
-pi-handoff update
-```
-
-Installed package integrations are updated when applicable.
-
-When `pi-handoff` itself is installed from a local development path, edits to the local package become available after restarting Pi or running:
-
-```text
-/reload
-```
-
----
-
-## Start Pi
-
-```bash
+       ↓
 pi-handoff start
+       ↓
+agent works within Authorized Scope
+       ↓
+semantic handoff when needed
+       ↓
+fresh session verifies project state
+       ↓
+continue authorized IN_PROGRESS work, or wait for the user
 ```
 
-Normal startup:
+A model may request a handoff after a meaningful unit of work. The supervisor waits until Pi reaches a safe boundary, prepares `.agent/HANDOFF.md`, validates that it changed, then requests a fresh session. `COMPLETE`, `BLOCKED`, and `AWAITING_USER` sessions verify the checkpoint and wait; only `IN_PROGRESS` may continue, once, and only within its Authorized Scope.
 
-```text
-validate project
-   ↓
-sync CodeGraph
-   ↓
-read HANDOFF.md
-   ↓
-start Pi
-```
+## Commands
 
-Crash startup:
+### `pi-handoff init [--cwd DIR] [--install-tools] [--dry-run]`
 
-```text
-validate project
-   ↓
-detect RECOVERY.json status=active
-   ↓
-preserve RECOVERY.last-crash.json
-   ↓
-sync CodeGraph
-   ↓
-start Pi in Recovery Mode
-```
+Prepares the project: registers the local pi-handoff package and CodeGraph extension as needed, initializes the CodeGraph index, creates `.agent/HANDOFF.md`, merges managed lifecycle instructions into `AGENTS.md`, configures `.pi/settings.json`, and excludes legacy global extension copies in the project. It is intended to be idempotent. `--install-tools` installs missing pinned tools; it never replaces an installed unsupported Pi.
 
-Additional Pi options may be passed after `--`:
+### `pi-handoff doctor [--cwd DIR]`
+
+Reports project health and Pi compatibility, including the installed version and supported range. Returns nonzero when required checks fail or Pi is incompatible/unverifiable.
+
+### `pi-handoff status [--cwd DIR]`
+
+Reports project health, Pi compatibility, and CodeGraph status when the CLI and index are available.
+
+### `pi-handoff update [--cwd DIR] [--dry-run]`
+
+Updates configured pi-handoff and CodeGraph Pi package integrations when applicable. For a local checkout, changes are available after Pi restarts or `/reload`. This command does **not** update Pi core.
+
+### `pi-handoff start [--cwd DIR] [--dry-run] [-- PI OPTIONS]`
+
+Runs compatibility and project preflight checks, syncs CodeGraph, then starts Pi. Startup selects Recovery Mode when an active crash journal exists; otherwise it applies normal HANDOFF semantics and the Resume Guard. Compatibility rejection occurs before CodeGraph sync, Recovery mutation, Resume Guard consumption, or Pi launch.
+
+Pass Pi options after `--`, for example:
 
 ```bash
-pi-handoff start -- <PI OPTIONS>
+pi-handoff start -- --help
 ```
 
----
+## Project-local files
 
-# Repository files
+An initialized project may contain:
 
-A project initialized with `pi-handoff` may contain:
+| Path | Purpose |
+| --- | --- |
+| `.agent/HANDOFF.md` | Human-readable semantic checkpoint and authorization scope. |
+| `.agent/RECOVERY.json` | Incremental crash journal; active status signals unexpected termination. |
+| `.agent/RECOVERY.last-crash.json` | Preserved crash evidence for diagnosis. |
+| `.agent/HANDOFF.resume.json` | Human-readable summary of the most recently claimed IN_PROGRESS checkpoint. |
+| `.agent/HANDOFF.resume.claims/` | Atomic per-fingerprint Resume Guard claims. |
+| `.codegraph/` | Generated CodeGraph index. |
+| `.pi/settings.json` | Project-local Pi package and extension configuration. |
+| `AGENTS.md` | Project instructions with a managed pi-handoff lifecycle section. |
 
-```text
-project/
-├── .agent/
-│   ├── HANDOFF.md
-│   ├── RECOVERY.json
-│   └── RECOVERY.last-crash.json
-│
-├── .codegraph/
-│
-├── .pi/
-│   └── settings.json
-│
-└── AGENTS.md
-```
+These artifacts belong to the project. `.agent/`, `.codegraph/`, and `.pi/` are ignored by this repository's own `.gitignore`; an initialized user's repository manages them according to that project's Git policy.
 
-## HANDOFF.md
+## Ownership boundaries
 
-A semantic checkpoint intended for a fresh agent session.
+`pi-handoff` owns its extension package, lifecycle coordination, and project metadata it creates or manages. It does not own Pi core, CodeGraph core, application source code, or Git history. It does not patch or copy Pi internals, and it leaves legacy global extension files intact; initialized projects exclude those files where appropriate to prevent duplicate handlers.
 
-It should describe information such as:
-
-- current goal;
-- completed work;
-- important decisions;
-- files changed;
-- tests;
-- current repository state;
-- blockers;
-- next safe action.
-
-Future versions will strengthen explicit authorization fields such as:
-
-```text
-User Request
-Authorized Scope
-Work Status
-Requires User Approval
-```
-
----
-
-## RECOVERY.json
-
-A machine-oriented crash journal.
-
-Unlike `HANDOFF.md`, it is updated incrementally while the agent is running.
-
-Its purpose is not to describe the project elegantly; its purpose is to provide evidence after an abnormal termination.
-
----
-
-# Pi extension architecture
-
-`pi-handoff` ships its Pi extensions from:
-
-```text
-extensions/
-├── index.ts
-├── handoff.ts
-├── session-supervisor.ts
-├── codegraph-auto-sync.ts
-├── codegraph-guard.ts
-└── recovery.ts
-```
-
-`extensions/index.ts` is the package entrypoint that registers the individual extensions with Pi.
-
-These files are owned by `pi-handoff`.
-
-They are **not patches to Pi itself**.
-
----
-
-# Pi ownership and upgrade policy
-
-`pi-handoff` does not overwrite Pi core files.
-
-The separation is intentional:
-
-```text
-Pi installation
-    ↓
-Pi public extension API
-    ↓
-pi-handoff package
-    ↓
-pi-handoff extensions
-```
-
-When Pi is upgraded:
-
-1. Pi updates its own code.
-2. `pi-handoff` remains a separate package.
-3. Existing project configuration continues loading the package.
-4. If Pi changes its extension API, a compatible `pi-handoff` release must adapt to that API.
-
-`pi-handoff` should never solve Pi compatibility by copying patched Pi source files into this repository.
-
----
-
-# Legacy global extensions
-
-Early development versions used global files such as:
-
-```text
-~/.pi/agent/extensions/handoff.ts
-~/.pi/agent/extensions/session-supervisor.ts
-~/.pi/agent/extensions/codegraph-auto-sync.ts
-~/.pi/agent/extensions/codegraph-guard.ts
-~/.pi/agent/extensions/recovery.ts
-```
-
-They may still exist on a development machine.
-
-Initialized repositories explicitly exclude these legacy files so that the package version is loaded only once.
-
-This prevents duplicate event handlers such as:
-
-```text
-two tool_call listeners
-two recovery writers
-two session supervisors
-```
-
-The package version under:
-
-```text
-pi-handoff/extensions/
-```
-
-is the source of truth.
-
----
-
-# Development
-
-Install dependencies:
+## Development and validation
 
 ```bash
 npm install
-```
-
-Run tests:
-
-```bash
 npm test
+npm run typecheck
 ```
 
-Run TypeScript validation:
+The automated suite exercises lifecycle behavior with deterministic extension and CLI harnesses. A real Pi run is still useful for validating host event ordering and session replacement.
 
-```bash
-npx tsc --noEmit
-```
+## License
 
-The project should keep lifecycle behavior covered by automated tests before publishing releases.
-
----
-
-# Design principles
-
-## Repository state is authoritative
-
-The agent should prefer:
-
-```text
-Git
-+ on-disk files
-+ CodeGraph
-```
-
-over remembered conversational state.
-
----
-
-## Preserve state, not conversation
-
-A previous Pi conversation should not be required to continue development.
-
-Important information belongs in project artifacts.
-
----
-
-## Semantic checkpoints over arbitrary truncation
-
-A clean feature boundary is preferable to cutting a session merely because it is old.
-
-Context-pressure handoff exists as a fallback.
-
----
-
-## Recovery is different from handoff
-
-A normal handoff means the previous agent deliberately reached a stable checkpoint.
-
-A crash means the previous operation may have ended at any point.
-
-Therefore:
-
-```text
-normal handoff
-→ continuation may be automatic
-
-crash recovery
-→ diagnosis first
-→ user decides how to continue
-```
-
----
-
-## User authorization survives session boundaries
-
-A recommended next step is not automatically permission to execute it.
-
-Future lifecycle metadata should explicitly distinguish:
-
-```text
-what is complete
-what is still authorized
-what merely makes sense to do next
-what requires new user approval
-```
-
----
-
-# Status
-
-`pi-handoff` is currently under active development.
-
-The current implementation has been validated with:
-
-- semantic multi-session handoffs;
-- CodeGraph-assisted repository navigation;
-- context-aware session management;
-- abrupt Pi termination using `SIGKILL`;
-- persisted unfinished-tool recovery;
-- fresh-session Recovery Mode;
-- user-assisted recovery decisions.
-
-It has also been exercised during a multi-stage real-world refactoring of a larger TypeScript repository rather than only on synthetic test projects.
-
----
-
-# Roadmap
-
-Near-term work includes:
-
-- stronger scope and authorization persistence;
-- context-pressure detection during the active agent loop;
-- improved recovery metadata;
-- package compatibility checks for Pi versions;
-- reduced false positives in the CodeGraph discovery guard;
-- automated lifecycle regression tests;
-- published package installation and upgrade flow.
-
----
-
-# License
-
-Add the chosen project license here before public distribution.
+MIT. See [LICENSE](LICENSE).

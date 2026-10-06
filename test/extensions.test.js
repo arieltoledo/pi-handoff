@@ -28,6 +28,7 @@ async function harness(extension) {
   extension(pi);
   return { cwd, template, handlers, commands, tools, messages, notices, ctx, pi,
     emit: async (event, data = {}) => handlers.get(event)?.(data, ctx),
+    toolCall: async (data = {}) => handlers.get('tool_call')?.(data, ctx),
     write: async text => writeFile(join(cwd, '.agent/HANDOFF.md'), text),
   };
 }
@@ -66,6 +67,184 @@ test('70 percent context triggers preparation; cancel prevents pending reset', a
   assert.equal(h.messages.length, 1);
   await h.commands.get('supervisor-cancel').handler('', h.ctx);
   await h.write(h.template + '\nRefreshed.\n');
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+});
+
+test('context pressure boundaries distinguish normal, soft, and hard states', async () => {
+  const normal = await harness(supervisor);
+  normal.ctx.getContextUsage = () => ({ percent: 64.9 });
+  await normal.emit('tool_execution_end', { toolName: 'edit', isError: false });
+  await normal.emit('agent_settled');
+  assert.equal(normal.messages.length, 0);
+  assert.equal(await normal.toolCall({ toolName: 'next-tool' }), undefined);
+
+  const soft = await harness(supervisor);
+  for (const percent of [65, 66.5, 69.9]) {
+    soft.ctx.getContextUsage = () => ({ percent });
+    await soft.emit('tool_execution_end', { toolName: 'edit', isError: false });
+    await soft.emit('turn_end', { turnIndex: 1, toolResults: [] });
+    assert.equal(await soft.toolCall({ toolName: 'next-tool' }), undefined);
+    await soft.emit('agent_settled');
+    assert.equal(soft.messages.length, 0);
+  }
+
+  soft.ctx.getContextUsage = () => ({ percent: 70 });
+  await soft.emit('tool_execution_end', { toolName: 'edit', isError: false });
+  assert.deepEqual(await soft.toolCall({ toolName: 'next-tool' }), {
+    block: true,
+    terminate: true,
+    reason: 'Context pressure requires a safe handoff.',
+  });
+});
+
+test('hard pressure is latched after a completed tool during the active loop', async () => {
+  const h = await harness(supervisor);
+  let percent = 69;
+  let abortCalls = 0;
+  h.ctx.getContextUsage = () => ({ percent });
+  h.ctx.abort = () => { abortCalls++; };
+
+  // This call started while pressure was below the hard threshold.
+  assert.equal(await h.toolCall({ toolName: 'migration-write' }), undefined);
+  percent = 70;
+  const completedTool = { toolName: 'migration-write', isError: false, result: { content: [] } };
+  await h.emit('tool_execution_end', completedTool);
+
+  assert.equal(completedTool.isError, false, 'the threshold-crossing tool result remains completed');
+  assert.equal(abortCalls, 0, 'the supervisor does not abort an already-running tool');
+  assert.equal(h.messages.length, 0, 'preparation waits for the safe settled boundary');
+  assert.deepEqual(await h.toolCall({ toolName: 'later-tool' }), {
+    block: true,
+    terminate: true,
+    reason: 'Context pressure requires a safe handoff.',
+  });
+
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0][0], /Prepare a session handoff/);
+});
+
+test('hard pressure and duplicate events converge on one refreshed handoff lifecycle', async () => {
+  const h = await harness(supervisor);
+  h.ctx.getContextUsage = () => ({ percent: 70 });
+  await h.emit('tool_execution_end', { toolName: 'edit', isError: false });
+  await h.emit('turn_end', { turnIndex: 1, toolResults: [] });
+  await h.emit('tool_execution_end', { toolName: 'edit-again', isError: false });
+  assert.equal(h.messages.length, 0);
+
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+
+  // The control turn remains above the threshold while it refreshes HANDOFF.md.
+  await h.emit('tool_execution_end', { toolName: 'write-handoff', isError: false });
+  await h.emit('turn_end', { turnIndex: 2, toolResults: [] });
+  await h.write(h.template + '\nVerified: pressure checkpoint refreshed.\n');
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 2, 'control-turn pressure cannot recursively prepare another handoff');
+  assert.deepEqual(h.messages[1], ['/new-handoff', { expandPromptTemplates: true }]);
+  await h.emit('session_start');
+  h.ctx.getContextUsage = () => ({ percent: 20 });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 2, 'the handoff lifecycle requests only one reset');
+});
+
+test('explicit request_handoff and hard pressure converge in either order', async () => {
+  for (const order of ['request-first', 'pressure-first']) {
+    const h = await harness(supervisor);
+    h.ctx.getContextUsage = () => ({ percent: 70 });
+    if (order === 'request-first') {
+      await h.tools.get('request_handoff').execute('id', { reason: 'feature complete' });
+      await h.emit('tool_execution_end', { toolName: 'edit', isError: false });
+    } else {
+      await h.emit('tool_execution_end', { toolName: 'edit', isError: false });
+      await h.tools.get('request_handoff').execute('id', { reason: 'feature complete' });
+    }
+    await h.emit('agent_settled');
+    await h.emit('tool_execution_end', { toolName: 'handoff-control', isError: false });
+    await h.write(h.template + `\nVerified: ${order} checkpoint refreshed.\n`);
+    await h.emit('agent_settled');
+    assert.equal(h.messages.length, 2, `${order} must prepare once and request one reset`);
+    assert.deepEqual(h.messages[1], ['/new-handoff', { expandPromptTemplates: true }]);
+  }
+});
+
+test('supervisor cancel suppresses pressure until a new session resets the state', async () => {
+  const h = await harness(supervisor);
+  h.ctx.getContextUsage = () => ({ percent: 70 });
+  await h.emit('tool_execution_end', { toolName: 'edit', isError: false });
+  await h.commands.get('supervisor-cancel').handler('', h.ctx);
+  await h.emit('turn_end', { turnIndex: 1, toolResults: [] });
+  await h.emit('tool_execution_end', { toolName: 'later-edit', isError: false });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 0);
+
+  await h.emit('session_start');
+  await h.emit('tool_execution_end', { toolName: 'new-session-edit', isError: false });
+  assert.deepEqual(await h.toolCall({ toolName: 'after-reset' }), {
+    block: true,
+    terminate: true,
+    reason: 'Context pressure requires a safe handoff.',
+  });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+});
+
+test('missing context usage is ignored and the supervisor remains operational', async () => {
+  const h = await harness(supervisor);
+  for (const usage of [undefined, {}, { percent: undefined }, { percent: null }]) {
+    h.ctx.getContextUsage = () => usage;
+    await h.emit('tool_execution_end', { toolName: 'edit', isError: false });
+    await h.emit('turn_end', { turnIndex: 1, toolResults: [] });
+    await h.emit('agent_settled');
+    assert.equal(await h.toolCall({ toolName: 'next-tool' }), undefined);
+    assert.equal(h.messages.length, 0);
+  }
+  await h.tools.get('request_handoff').execute('id', { reason: 'manual request still works' });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+});
+
+test('pressure preparation failure is suppressed until a new session', async () => {
+  const h = await harness(supervisor);
+  h.ctx.getContextUsage = () => ({ percent: 70 });
+  await h.emit('tool_execution_end', { toolName: 'edit', isError: false });
+  await h.emit('agent_settled');
+  await h.write('# invalid refreshed handoff');
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1);
+  assert.match(h.notices.at(-1)[0], /Session preserved/);
+
+  await h.emit('tool_execution_end', { toolName: 'later-edit', isError: false });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 1, 'failure does not retry automatically in the same session');
+
+  await h.emit('session_start');
+  await h.emit('tool_execution_end', { toolName: 'new-session-edit', isError: false });
+  await h.emit('agent_settled');
+  assert.equal(h.messages.length, 2, 'a new session clears pressure suppression');
+});
+
+test('parallel-batch completion does not imply an already-running sibling can be cancelled', async () => {
+  const h = await harness(supervisor);
+  h.ctx.getContextUsage = () => ({ percent: 69 });
+
+  // Both calls have passed tool_call and represent work already in the active batch.
+  assert.equal(await h.toolCall({ toolName: 'tool-a' }), undefined);
+  assert.equal(await h.toolCall({ toolName: 'tool-b' }), undefined);
+  h.ctx.getContextUsage = () => ({ percent: 70 });
+  await h.emit('tool_execution_end', { toolName: 'tool-a', isError: false });
+  assert.equal(h.messages.length, 0);
+  await h.emit('tool_execution_end', { toolName: 'tool-b', isError: false });
+  assert.equal(h.messages.length, 0);
+
+  // The next call is the one the supervisor can stop; the simulated batch does
+  // not claim to model Pi's internal scheduling of true parallel tool execution.
+  assert.deepEqual(await h.toolCall({ toolName: 'tool-c' }), {
+    block: true,
+    terminate: true,
+    reason: 'Context pressure requires a safe handoff.',
+  });
   await h.emit('agent_settled');
   assert.equal(h.messages.length, 1);
 });

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import supervisor from '../extensions/session-supervisor.ts';
 import handoff from '../extensions/handoff.ts';
 import sync from '../extensions/codegraph-auto-sync.ts';
+import codegraphGuard from '../extensions/codegraph-guard.ts';
 import { packageRoot } from '../lib/cli.js';
 import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { readResumeGuard } from '../lib/resume-guard.js';
@@ -371,6 +372,100 @@ test('sync failures retain dirty state for retry', async () => {
   await h.emit('agent_settled');
   await h.emit('agent_settled');
   assert.equal(attempts, 2);
+});
+
+test('CodeGraph guard allows ls, known-file reads, normal development, and output filtering', async () => {
+  const allowed = [
+    ['bash', 'ls'],
+    ['bash', 'ls -la'],
+    ['bash', 'ls src'],
+    ['bash', 'ls ./src/components'],
+    ['bash', 'npx vitest run | grep failed'],
+    ['bash', 'pytest -q | grep FAILED'],
+    ['bash', 'npm test 2>&1 | grep Error'],
+    ['bash', 'grep ERROR build.log'],
+    ['bash', 'grep -i warning output.txt'],
+    ['bash', 'cat build.log | grep ERROR'],
+    ['bash', 'npm test | rg failed'],
+    ['bash', 'python script.py | rg result'],
+    ['bash', 'npm test 2>&1 | grep FAIL'],
+    ['bash', 'command | grep x | head'],
+    ['bash', 'cat src/foo.ts'],
+    ['bash', 'head -100 src/foo.ts'],
+    ['bash', "sed -n '1,80p' src/foo.ts"],
+    ['bash', 'npm test'],
+    ['bash', 'npx vitest'],
+    ['bash', 'pytest'],
+    ['bash', 'git status'],
+    ['bash', 'git diff'],
+  ];
+
+  for (const [toolName, command] of allowed) {
+    const h = await harness(codegraphGuard);
+    assert.equal(
+      await h.toolCall({ toolName, input: { command } }),
+      undefined,
+      `${toolName}: ${command} should be allowed before CodeGraph`,
+    );
+    assert.equal(h.notices.length, 0);
+  }
+});
+
+test('CodeGraph guard blocks direct discovery producers before orientation', async () => {
+  const blocked = [
+    ['bash', 'rg "SomeSymbol"'],
+    ['bash', 'rg "SomeSymbol" .'],
+    ['bash', 'rg -n "SomeSymbol" src'],
+    ['bash', 'rg "SomeSymbol" . | head'],
+    ['bash', 'find . -type f'],
+    ['bash', 'find src -name "*.ts"'],
+    ['bash', 'find .agent -type f'],
+    ['bash', 'find . -type f | head'],
+    ['bash', 'grep -R "SomeSymbol" .'],
+    ['bash', 'grep -rn "SomeSymbol" src'],
+    ['powershell', 'rg "SomeSymbol" .'],
+    ['powershell', 'find . -type f'],
+  ];
+
+  for (const [toolName, command] of blocked) {
+    const h = await harness(codegraphGuard);
+    const result = await h.toolCall({ toolName, input: { command } });
+    assert.equal(result?.block, true, `${toolName}: ${command} should be blocked`);
+    assert.match(result.reason, /CodeGraph/i);
+    assert.equal(h.messages.length, 0, 'a blocked call produces no queued messages');
+    assert.equal(h.notices.length, 0, 'a blocked call produces no repeated notices');
+  }
+});
+
+test('CodeGraph tool attempt unlocks fallback discovery until the next agent turn', async () => {
+  const h = await harness(codegraphGuard);
+  const rg = { toolName: 'bash', input: { command: 'rg "SomeSymbol" .' } };
+  const find = { toolName: 'find', input: { pattern: '*.ts', path: 'src' } };
+
+  const blocked = await h.toolCall(rg);
+  assert.equal(blocked?.block, true);
+  assert.match(blocked.reason, /CodeGraph/i);
+
+  // tool_call fires before execution, so the guard treats an attempted
+  // CodeGraph invocation as the point where fallback discovery is unlocked.
+  assert.equal(await h.toolCall({ toolName: 'codegraph_explore', input: { query: 'SomeSymbol' } }), undefined);
+  assert.equal(await h.toolCall(rg), undefined);
+  assert.equal(await h.toolCall(find), undefined);
+
+  // before_agent_start, not session_start or turn_start, resets the latch.
+  await h.emit('before_agent_start', { prompt: 'Next agent turn' });
+  const blockedAgain = await h.toolCall(rg);
+  assert.equal(blockedAgain?.block, true);
+  assert.match(blockedAgain.reason, /CodeGraph/i);
+  assert.equal((await h.toolCall(find))?.block, true);
+});
+
+test('native Pi find is guarded for directory roots and unlocked after CodeGraph use', async () => {
+  const h = await harness(codegraphGuard);
+  const search = { toolName: 'find', input: { pattern: '**/*.ts', path: '.' } };
+  assert.equal((await h.toolCall(search))?.block, true);
+  assert.equal(await h.toolCall({ toolName: 'codegraph_explore', input: { query: 'source files' } }), undefined);
+  assert.equal(await h.toolCall(search), undefined);
 });
 test('new-handoff releases IN_PROGRESS checkpoint when session creation throws', async () => {
   const h = await harness(handoff);
